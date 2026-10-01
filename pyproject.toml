@@ -1,0 +1,65 @@
+[project]
+name = "ragdoc"
+version = "0.1.0"
+description = "Transparent, agentic RAG over documents with text, tables and images"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "alembic>=1.14",
+    "docling>=2.15",
+    "httpx>=0.27",
+    "langchain-core>=0.3",
+    "langchain-ollama>=0.3",
+    "langchain-text-splitters>=0.3",
+    "langgraph>=0.4",
+    "pillow>=11",
+    "psycopg[binary]>=3.2",
+    "pydantic-settings>=2.6",
+    "pymilvus>=2.6",
+    "sentence-transformers>=3.3",
+    "sqlalchemy>=2.0",
+    "streamlit>=1.40",
+    # Direct dependencies only so that [tool.uv.sources] below can choose their index.
+    "torch>=2.4",
+    "torchvision>=0.19",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "reportlab>=4",
+    "ruff>=0.8",
+]
+
+# On Linux (the Docker image) install the CPU-only PyTorch build. The default Linux wheels bundle
+# CUDA, which adds several GB and is useless without a GPU. Other platforms use PyPI as before.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ragdoc"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "app", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib"
+markers = [
+    "integration: needs `docker compose up` (Milvus, PostgreSQL) and/or Ollama",
+]

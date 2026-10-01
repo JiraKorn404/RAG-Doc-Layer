@@ -1,0 +1,81 @@
+name: ragdoc
+
+services:
+  # Milvus standalone with embedded etcd and local file storage (no separate etcd/MinIO
+  # containers). All state lives in the milvus_data volume.
+  milvus:
+    image: milvusdb/milvus:v2.6.0
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      DEPLOY_MODE: STANDALONE
+      ETCD_USE_EMBED: "true"
+      ETCD_DATA_DIR: /var/lib/milvus/etcd
+      ETCD_CONFIG_PATH: /milvus/configs/embedEtcd.yaml
+      COMMON_STORAGETYPE: local
+    volumes:
+      - milvus_data:/var/lib/milvus
+      - ./docker/milvus/embedEtcd.yaml:/milvus/configs/embedEtcd.yaml:ro
+    ports:
+      - "127.0.0.1:${MILVUS_PORT:-19530}:19530"
+      - "127.0.0.1:9091:9091"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ragdoc}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ragdoc}
+      POSTGRES_DB: ${POSTGRES_DB:-ragdoc}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # The Streamlit app. Optional: the app can also be run on the host with `uv run streamlit ...`.
+  app:
+    build: .
+    image: ragdoc-app
+    # Model names, the Ollama address and tunables come from .env, as on the host.
+    env_file:
+      - path: .env
+        required: false
+    # Inside the compose network the other services are reached by name, on their own ports.
+    # These override the host addresses in .env (127.0.0.1, 5433).
+    environment:
+      MILVUS_URI: http://milvus:19530
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      DATA_DIR: /app/data
+    volumes:
+      # Uploads and extracted images: the same folder the host app uses.
+      - ./data:/app/data
+      # Downloaded models (CLIP, Docling, OCR), kept across rebuilds.
+      - model_cache:/models
+    ports:
+      # This machine only: the app has no login.
+      - "127.0.0.1:${APP_PORT:-8502}:8502"
+    depends_on:
+      milvus:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  milvus_data:
+  postgres_data:
+  model_cache:

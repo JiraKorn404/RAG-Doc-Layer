@@ -1,0 +1,15 @@
+# Everything is excluded, then only what the image needs is let back in.
+*
+
+!pyproject.toml
+!uv.lock
+!README.md
+!alembic.ini
+!.streamlit/
+!migrations/
+!scripts/
+!src/
+!app/
+
+**/__pycache__/
+**/*.pyc

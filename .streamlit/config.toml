@@ -1,0 +1,8 @@
+[server]
+# 8501 is used by another project on this machine.
+port = 8502
+address = "127.0.0.1"
+maxUploadSize = 200
+
+[browser]
+gatherUsageStats = false
