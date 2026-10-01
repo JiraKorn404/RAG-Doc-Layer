@@ -14,7 +14,7 @@ from ragdoc.ingestion.chunking.factory import get_chunker
 from ragdoc.ingestion.parser import DocumentParser, get_parser
 from ragdoc.llm.embeddings import get_text_embedder
 from ragdoc.llm.image_embeddings import ImageEmbedder, get_image_embedder
-from ragdoc.schemas import ChunkType, IngestionProgress
+from ragdoc.schemas import ChunkingConfig, ChunkType, IngestionProgress
 from ragdoc.storage.milvus_store import MilvusStore
 
 ProgressCallback = Callable[[IngestionProgress], None]
@@ -37,6 +37,9 @@ class IngestionResult:
     n_image_chunks: int = 0
     n_pages: int | None = None
     ocr_used: bool = False
+    chunking: ChunkingConfig | None = None
+    # Windows of text the LLM-based strategy could not handle and split plainly instead.
+    n_chunk_fallbacks: int = 0
     # parse_ms, chunk_ms, embed_ms, store_ms, total_ms
     timings: dict[str, float] = field(default_factory=dict)
 
@@ -46,14 +49,15 @@ class IngestionPipeline:
         self,
         *,
         parser: DocumentParser,
-        chunker: Chunker,
+        chunker_factory: Callable[[ChunkingConfig], Chunker],
         text_embedder: Embeddings,
         image_embedder_factory: Callable[[], ImageEmbedder],
         store: MilvusStore,
         settings: Settings | None = None,
     ):
         self._parser = parser
-        self._chunker = chunker
+        # A factory, because each upload chooses its chunking strategy and parameters.
+        self._chunker_factory = chunker_factory
         self._text_embedder = text_embedder
         # A factory, so the image model is only loaded for documents that contain images.
         self._image_embedder_factory = image_embedder_factory
@@ -70,18 +74,20 @@ class IngestionPipeline:
         doc_id: str,
         filename: str,
         ocr: bool = False,
+        chunking: ChunkingConfig | None = None,
         on_progress: ProgressCallback | None = None,
         should_stop: StopCheck | None = None,
     ) -> IngestionResult:
-        """Ingest one file.
+        """Ingest one file. `chunking=None` means the configured default strategy.
 
-        `should_stop` is asked between page batches, between embedding batches and before
-        storing; when it returns True the run ends with `IngestionCancelled`. However the run
-        ends without a result (failure, cancellation, or the caller being interrupted), everything
-        written for `doc_id` is removed first.
+        `should_stop` is asked between page batches, between the model calls of the chunking
+        step, between embedding batches and before storing; when it returns True the run ends
+        with `IngestionCancelled`. However the run ends without a result (failure, cancellation,
+        or the caller being interrupted), everything written for `doc_id` is removed first.
         """
         try:
-            return self._run(path, doc_id, filename, ocr, on_progress, should_stop)
+            chunking = chunking or self._settings.default_chunking()
+            return self._run(path, doc_id, filename, ocr, chunking, on_progress, should_stop)
         except BaseException:
             # BaseException, not Exception: Streamlit stops a script (page refresh, closed tab)
             # by raising one that is not an Exception, from inside the progress callback.
@@ -99,6 +105,7 @@ class IngestionPipeline:
         doc_id: str,
         filename: str,
         ocr: bool,
+        chunking: ChunkingConfig,
         on_progress: ProgressCallback | None,
         should_stop: StopCheck | None,
     ) -> IngestionResult:
@@ -140,7 +147,13 @@ class IngestionPipeline:
         mark = timed("parse_ms", started)
 
         checkpoint("chunk", "Chunking")
-        chunks = self._chunker.chunk(elements, doc_id=doc_id, metadata={"filename": filename})
+        chunker = self._chunker_factory(chunking)
+        chunks = chunker.chunk(
+            elements,
+            doc_id=doc_id,
+            metadata={"filename": filename, "chunker": chunking.strategy},
+            checkpoint=lambda message, current, total: checkpoint("chunk", message, current, total),
+        )
         text_chunks = [chunk for chunk in chunks if chunk.chunk_type is not ChunkType.IMAGE]
         image_chunks = [chunk for chunk in chunks if chunk.chunk_type is ChunkType.IMAGE]
         if not chunks:
@@ -190,16 +203,19 @@ class IngestionPipeline:
             n_image_chunks=len(image_chunks),
             n_pages=n_pages,
             ocr_used=ocr,
+            chunking=chunking,
+            n_chunk_fallbacks=chunker.n_fallbacks,
             timings=timings,
         )
 
 
 def build_pipeline(store: MilvusStore, settings: Settings | None = None) -> IngestionPipeline:
     settings = settings or get_settings()
+    text_embedder = get_text_embedder(settings)
     return IngestionPipeline(
         parser=get_parser(settings),
-        chunker=get_chunker(settings),
-        text_embedder=get_text_embedder(settings),
+        chunker_factory=lambda config: get_chunker(config, settings, text_embedder=text_embedder),
+        text_embedder=text_embedder,
         image_embedder_factory=lambda: get_image_embedder(settings),
         store=store,
         settings=settings,

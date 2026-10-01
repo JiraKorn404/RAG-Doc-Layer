@@ -13,8 +13,11 @@ from ragdoc.schemas import (
     ChatResult,
     ChunkType,
     IngestionProgress,
+    LLMChunking,
+    RecursiveChunking,
     RetrievalResult,
     RetrievedChunk,
+    SemanticChunking,
     TraceEvent,
 )
 from ragdoc.services.chat_service import ConversationInfo, MessageView
@@ -141,9 +144,17 @@ class FakeChatService:
 class FakeDocumentService:
     supported_extensions = ["pdf", "txt"]
     ocr_default = False
+    default_chunker = "recursive"
+    chunking_defaults = {
+        "recursive": RecursiveChunking(),
+        "semantic": SemanticChunking(),
+        "llm": LLMChunking(),
+    }
 
     def __init__(self):
         self.ocr_seen: list[bool] = []
+        self.chunking_seen: list = []
+        self.chunk_fallbacks = 0
         self.cancel_next = False
         self.documents: list[DocumentInfo] = [
             self._info(
@@ -171,10 +182,11 @@ class FakeDocumentService:
     def list_documents(self):
         return self.documents
 
-    def ingest(self, filename, data, on_progress=None, ocr=None):
+    def ingest(self, filename, data, on_progress=None, ocr=None, chunking=None):
         if any(document.filename == filename for document in self.documents):
             raise DuplicateDocumentError(self.documents[0])
         self.ocr_seen.append(ocr)
+        self.chunking_seen.append(chunking)
         if on_progress:
             on_progress(IngestionProgress(stage="parse", message="Parsing document"))
             on_progress(
@@ -194,6 +206,9 @@ class FakeDocumentService:
             n_text_chunks=0 if scanned else 1,
             n_image_chunks=2 if scanned else 0,
             ocr_used=bool(ocr),
+            chunker=chunking.strategy,
+            chunk_params=chunking.params,
+            chunk_fallbacks=self.chunk_fallbacks,
             timings={"parse_ms": 61000, "embed_ms": 9000, "total_ms": 72000},
         )
         self.documents.insert(0, document)
@@ -319,9 +334,10 @@ def test_upload_indexes_the_file_and_reports_the_result(app):
     assert documents.documents[0].filename == "notes.txt"
     assert at.success[0].value == (
         "**notes.txt**: 1 text, 0 table and 0 image chunks indexed in 1 min 12 s "
-        "(parsing 1 min 01 s, embedding 9 s). OCR was off."
+        "(parsing 1 min 01 s, embedding 9 s). OCR was off. Chunking: recursive."
     )
     assert documents.ocr_seen == [False]
+    assert documents.chunking_seen == [RecursiveChunking()]
     assert len(at.warning) == 0
     assert "**notes.txt**" in all_text(at)
     # The uploader is emptied, so the button is disabled again.
@@ -340,6 +356,66 @@ def test_ocr_checkbox_is_off_by_default_and_reaches_the_service(app):
     assert not at.exception, at.exception
     assert documents.ocr_seen == [True]
     assert "OCR was on." in at.success[0].value
+
+
+def parameter_labels(at: AppTest) -> list[str]:
+    return [n.label for n in at.number_input if n.key.startswith("chunking-")]
+
+
+def test_choosing_a_strategy_shows_its_parameters_and_reaches_the_service(app):
+    at, _chat, documents = app
+    [strategy] = [s for s in at.selectbox if s.label == "Chunking strategy"]
+    assert strategy.value == "recursive"
+    assert parameter_labels(at) == ["Chunk size (characters)", "Overlap (characters)"]
+
+    strategy.select("semantic").run()
+    assert parameter_labels(at) == [
+        "Breakpoint percentile",
+        "Buffer (sentences)",
+        "Minimum chunk size (characters)",
+        "Maximum chunk size (characters)",
+    ]
+    assert "comparing the embeddings" in all_text(at)
+    percentile = at.number_input(key="chunking-semantic-breakpoint_percentile")
+    assert (percentile.value, percentile.min, percentile.max) == (90, 50, 99)
+
+    percentile.set_value(75).run()
+    at.file_uploader[0].upload("notes.txt", b"hello", "text/plain").run()
+    button(at, "Upload and index").click().run()
+
+    assert not at.exception, at.exception
+    assert documents.chunking_seen == [SemanticChunking(breakpoint_percentile=75)]
+    assert "Chunking: semantic." in at.success[0].value
+    # The new document's row names the strategy; the older ones were chunked recursively.
+    values = [str(m.value) for m in at.markdown]
+    assert "Semantic" in values and "Recursive" in values
+
+
+def test_parameters_that_do_not_fit_together_block_the_upload(app):
+    at, _chat, documents = app
+    at.file_uploader[0].upload("notes.txt", b"hello", "text/plain").run()
+    at.number_input(key="chunking-recursive-chunk_size").set_value(300).run()
+    at.number_input(key="chunking-recursive-chunk_overlap").set_value(300).run()
+
+    assert "overlap must be smaller than the chunk size" in at.error[0].value
+    assert button(at, "Upload and index").disabled
+
+    at.number_input(key="chunking-recursive-chunk_overlap").set_value(50).run()
+    assert len(at.error) == 0
+    button(at, "Upload and index").click().run()
+    assert documents.chunking_seen == [RecursiveChunking(chunk_size=300, chunk_overlap=50)]
+
+
+def test_llm_windows_that_fell_back_are_reported(app):
+    at, _chat, documents = app
+    documents.chunk_fallbacks = 2
+    [strategy] = [s for s in at.selectbox if s.label == "Chunking strategy"]
+    strategy.select("llm").run()
+    at.file_uploader[0].upload("notes.txt", b"hello", "text/plain").run()
+    button(at, "Upload and index").click().run()
+
+    assert isinstance(documents.chunking_seen[0], LLMChunking)
+    assert "could not be used for 2 part(s)" in at.warning[0].value
 
 
 def test_document_with_no_text_and_ocr_off_gets_a_warning(app):

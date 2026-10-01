@@ -10,6 +10,7 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
@@ -22,7 +23,7 @@ from ragdoc.ingestion.pipeline import (
     ProgressCallback,
     build_pipeline,
 )
-from ragdoc.schemas import IngestionProgress
+from ragdoc.schemas import ChunkingConfig, IngestionProgress
 from ragdoc.storage.milvus_store import MilvusStore, get_milvus_store
 from ragdoc.storage.postgres.models import DocumentStatus
 from ragdoc.storage.postgres.repositories import DocumentRepository
@@ -48,12 +49,18 @@ class DocumentInfo(BaseModel):
     n_table_chunks: int = 0
     n_image_chunks: int = 0
     ocr_used: bool = False
+    # The chunking strategy used for the text, and its parameters.
+    chunker: str = "recursive"
+    chunk_params: dict[str, Any] | None = None
     created_at: datetime
     # How long ingestion took; None while processing or if it did not finish.
     ingest_seconds: float | None = None
     # Per-stage times of the ingestion that just finished (parse_ms, embed_ms, ...). Only set
     # on the value returned by `ingest`.
     timings: dict[str, float] = {}
+    # Windows of text the LLM-based chunking could not handle and split plainly instead. Only
+    # set on the value returned by `ingest`.
+    chunk_fallbacks: int = 0
 
 
 class DuplicateDocumentError(Exception):
@@ -87,6 +94,16 @@ class DocumentService:
     def ocr_default(self) -> bool:
         return self._settings.ocr_default
 
+    @property
+    def chunking_defaults(self) -> dict[str, ChunkingConfig]:
+        """Every chunking strategy with its configured default parameters, by name."""
+        return self._settings.chunking_defaults()
+
+    @property
+    def default_chunker(self) -> str:
+        """The strategy an upload uses unless it chooses another."""
+        return self._settings.chunker
+
     # Built on first use, so listing documents never loads parsing or embedding models.
     @property
     def store(self) -> MilvusStore:
@@ -110,8 +127,10 @@ class DocumentService:
         data: bytes,
         on_progress: ProgressCallback | None = None,
         ocr: bool | None = None,
+        chunking: ChunkingConfig | None = None,
     ) -> DocumentInfo:
-        """Store and index an uploaded file. `ocr=None` means the configured default.
+        """Store and index an uploaded file. `ocr=None` and `chunking=None` mean the configured
+        defaults.
 
         Returns the document with status `ready`, or `failed` with `error` set if processing
         went wrong (the failed document stays listed so the error is visible; uploading the
@@ -128,6 +147,7 @@ class DocumentService:
                 f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
             )
         ocr = self._settings.ocr_default if ocr is None else ocr
+        chunking = chunking or self._settings.default_chunking()
 
         file_hash = hashlib.sha256(data).hexdigest()
         retry_of: uuid.UUID | None = None
@@ -153,6 +173,8 @@ class DocumentService:
                 filename=filename,
                 file_hash=file_hash,
                 file_path=upload_path.relative_to(self._settings.data_path).as_posix(),
+                chunker=chunking.strategy,
+                chunk_params=chunking.params,
             )
 
         def deleted() -> bool:
@@ -166,6 +188,7 @@ class DocumentService:
                     doc_id=str(document_id),
                     filename=filename,
                     ocr=ocr,
+                    chunking=chunking,
                     on_progress=on_progress,
                     should_stop=deleted,
                 )
@@ -205,6 +228,7 @@ class DocumentService:
             info = DocumentInfo.model_validate(document)
         info.ingest_seconds = result.timings.get("total_ms", 0) / 1000
         info.timings = result.timings
+        info.chunk_fallbacks = result.n_chunk_fallbacks
         return info
 
     def list_documents(self) -> list[DocumentInfo]:

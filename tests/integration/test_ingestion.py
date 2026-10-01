@@ -4,7 +4,7 @@ import pytest
 
 from ragdoc.llm.embeddings import get_text_embedder
 from ragdoc.llm.image_embeddings import get_image_embedder
-from ragdoc.schemas import ChunkType
+from ragdoc.schemas import ChunkType, LLMChunking, SemanticChunking
 from ragdoc.services.document_service import DuplicateDocumentError
 from ragdoc.storage.postgres.models import DocumentStatus
 
@@ -41,7 +41,9 @@ def test_ingest_search_and_delete(sample_pdf, service_and_store):
     text_embedder = get_text_embedder(settings)
     hits = store.search_text(text_embedder.embed_query("Who is the chief executive?"), top_k=3)
     assert any("Mira Okafor" in hit.content for hit in hits)
-    assert all(hit.metadata == {"filename": sample_pdf.name} for hit in hits)
+    assert all(
+        hit.metadata == {"filename": sample_pdf.name, "chunker": "recursive"} for hit in hits
+    )
 
     # Table: stored as Markdown with its numbers intact.
     hits = store.search_text(
@@ -88,6 +90,53 @@ def test_plain_text_file(service_and_store):
     document = service.ingest("notes.txt", b"The warehouse in Gdansk opened in 2024.")
     assert document.status is DocumentStatus.READY
     assert (document.n_text_chunks, document.n_table_chunks, document.n_image_chunks) == (1, 0, 0)
+    assert service.delete(document.id) is True
+
+
+TWO_TOPICS = (
+    "The warehouse in Gdansk opened in March 2024. It stores spare parts for the conveyor "
+    "systems. Forty people work there in two shifts. The building has twelve loading docks. "
+    "Trucks arrive mostly in the early morning. A second warehouse is planned for Rotterdam.\n\n"
+    "Sourdough bread needs a starter of flour and water. The starter is fed every day for a "
+    "week. The dough rests overnight in the refrigerator. It is baked in a very hot oven with "
+    "steam. A good loaf has a crisp crust and an open crumb. The bread keeps for several days."
+)
+
+
+@pytest.mark.parametrize(
+    ("chunking", "progress_message"),
+    [
+        (
+            SemanticChunking(breakpoint_percentile=80, min_chunk_chars=100, max_chunk_chars=600),
+            "Chunking: embedding sentences",
+        ),
+        (
+            LLMChunking(target_chunk_chars=300, max_chunk_chars=600, window_chars=2000),
+            "Chunking: sentences read by the chat model",
+        ),
+    ],
+)
+def test_text_is_chunked_by_the_chosen_strategy(service_and_store, chunking, progress_message):
+    """The real embedding and chat models decide the boundaries of a two-topic text."""
+    service, store, settings = service_and_store
+    progress = []
+
+    document = service.ingest(
+        "topics.txt", TWO_TOPICS.encode(), chunking=chunking, on_progress=progress.append
+    )
+
+    assert document.status is DocumentStatus.READY, document.error
+    assert (document.chunker, document.chunk_params) == (chunking.strategy, chunking.params)
+    assert document.chunk_fallbacks == 0
+    assert progress_message in [p.message for p in progress if p.stage == "chunk"]
+    assert document.n_text_chunks >= 2
+
+    hits = store.search_text(get_text_embedder(settings).embed_query("sourdough bread"), top_k=20)
+    assert len(hits) == document.n_text_chunks
+    assert all(hit.metadata["chunker"] == chunking.strategy for hit in hits)
+    assert all(len(hit.content) <= 600 for hit in hits)
+    # The best hit is about bread and does not also contain the warehouse topic.
+    assert "ourdough" in hits[0].content and "Gdansk" not in hits[0].content
     assert service.delete(document.id) is True
 
 

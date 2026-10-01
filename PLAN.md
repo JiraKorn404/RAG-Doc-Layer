@@ -14,7 +14,7 @@ and shows how it got each answer: its steps, the chunks it retrieved, and their 
 | D1 | Vector DB | Milvus standalone in Docker | confirmed |
 | D2 | Relational DB | PostgreSQL in Docker: conversations, traces, performance, document registry | confirmed |
 | D3 | Chat + text embedding | `langchain-ollama` | confirmed |
-| D4 | Chunking | Recursive, behind a `Chunker` interface | confirmed |
+| D4 | Chunking | Recursive, behind a `Chunker` interface. Phase 5d adds semantic and LLM-based, chosen per upload with tunable parameters; recursive stays the default | confirmed |
 | D5 | Retrieval | Vector similarity search only for now; reranking added in Phase 7 | confirmed |
 | D6 | Agent | Custom LangGraph `StateGraph` with explicit nodes | confirmed |
 | D7 | Frontend | Streamlit, tabs: Chat, Documents | confirmed |
@@ -61,7 +61,7 @@ with `OLLAMA_HOST=0.0.0.0`, and all clients need timeouts and a clear unreachabl
 | `content` | VARCHAR | chunk text, or table as Markdown |
 | `page` | INT64 | |
 | `chunk_index` | INT64 | order within the document |
-| `metadata` | JSON | headings, filename, ... |
+| `metadata` | JSON | `filename`, `chunker` (strategy that produced the chunk) |
 | `embedding` | FLOAT_VECTOR(`TEXT_EMBED_DIM`) | |
 
 `image_chunks` (HNSW, COSINE)
@@ -80,7 +80,7 @@ with `OLLAMA_HOST=0.0.0.0`, and all clients need timeouts and a clear unreachabl
 
 | Table | Columns |
 |---|---|
-| `documents` | `id`, `filename`, `file_hash` (unique), `file_path`, `status` (`processing`/`ready`/`failed`), `error`, `n_text_chunks`, `n_table_chunks`, `n_image_chunks`, `created_at` |
+| `documents` | `id`, `filename`, `file_hash` (unique), `file_path`, `status` (`processing`/`ready`/`failed`), `error`, `n_text_chunks`, `n_table_chunks`, `n_image_chunks`, `ocr_used`, `chunker`, `chunk_params` (JSONB), `created_at` |
 | `conversations` | `id`, `title`, `created_at`, `updated_at` |
 | `messages` | `id`, `conversation_id`, `role`, `content`, `reasoning`, `created_at` |
 | `retrieved_chunks` | `id`, `message_id`, `chunk_id`, `doc_id`, `chunk_type`, `content_snapshot`, `image_path` (nullable), `metadata` (JSONB), `page`, `similarity_score`, `rerank_score` (nullable, unused until Phase 7), `rank`, `used_in_answer` |
@@ -91,7 +91,7 @@ with `OLLAMA_HOST=0.0.0.0`, and all clients need timeouts and a clear unreachabl
 ## 4. Pipelines
 
 **Ingestion**: upload -> hash check -> save file -> Docling parse into elements
-(`text` / `table` / `image`) -> text through the recursive chunker, tables as whole Markdown
+(`text` / `table` / `image`) -> text through the chunker chosen for the upload, tables as whole Markdown
 chunks, images saved to disk -> embed (Ollama for text and tables, CLIP for images) -> insert into
 Milvus -> update `documents` and `ingestion_metrics`.
 
@@ -307,6 +307,162 @@ batch (roughly 30 to 40 s at the default size).
   `OCR_DEFAULT`, or `--ocr`) turns it on.
 - 4 pages per batch.
 
+### Phase 5d: Chunking strategy chosen per upload (implemented 2026-10-01, verification open)
+
+Goal: on the Documents tab, each upload picks one of three chunking strategies and tunes its
+parameters. The choice is recorded with the document and shown in the documents table, so the
+effect of a strategy on retrieval can be compared.
+
+Today the chunker is fixed for the whole process: `build_pipeline` calls `get_chunker(settings)`
+once and `CHUNKER` / `CHUNK_SIZE` / `CHUNK_OVERLAP` come from `.env`. This phase makes it an
+argument of each ingestion, the same way `ocr` already is.
+
+#### 1. What a strategy changes, and what it does not
+
+Only how the **text** elements are split. For all three strategies:
+
+- Tables stay whole Markdown chunks, split by rows over `TABLE_MAX_CHARS`; one chunk per image.
+- A strategy works on one text element at a time. The parser already merges text per page, so
+  chunks still never span pages and every chunk keeps its page number.
+- No chunk exceeds its strategy's maximum size, and none can exceed 16000 characters (Milvus
+  `VARCHAR` limit). A piece over the maximum is cut between sentences into parts of similar
+  size; only a single sentence that is itself too long is cut with the recursive splitter.
+- Sentence splitting (semantic, LLM-based) is a regex and assumes English (D17).
+
+So the table and image handling moves out of `RecursiveChunker` into a shared `BaseChunker`,
+and each strategy implements only `split_texts(texts, checkpoint) -> list[list[str]]`: all text
+elements of the document at once, because the semantic threshold is document-wide.
+
+#### 2. The strategies and their parameters
+
+Defaults come from `Settings` / `.env`; the UI starts from them and each upload can override.
+
+**Recursive** (current behaviour, stays the default). No model calls.
+
+| Parameter | Default | Range | Meaning |
+|---|---|---|---|
+| `chunk_size` | 1000 | 200 - 16000 | Maximum characters per chunk |
+| `chunk_overlap` | 150 | 0 - below `chunk_size` | Characters repeated between neighbouring chunks |
+
+**Semantic**. Splits where the topic changes: sentences are embedded with the text embedding
+model (document path, no query instruction), and a chunk boundary is placed where the cosine
+distance between neighbouring sentence groups is unusually large for that document.
+
+| Parameter | Default | Range | Meaning |
+|---|---|---|---|
+| `breakpoint_percentile` | 90 | 50 - 99 | A boundary is placed where the distance is above this percentile of all distances in the document. Lower gives more, smaller chunks |
+| `buffer_sentences` | 1 | 0 - 3 | Sentences on each side joined to a sentence before embedding it, to smooth out very short sentences |
+| `min_chunk_chars` | 200 | 0 - 2000 | A smaller chunk is merged into its neighbour |
+| `max_chunk_chars` | 2000 | 500 - 16000 | A larger chunk is cut between sentences |
+
+Written in this project (about a hundred lines) rather than taken from `langchain_experimental`:
+it needs batching, progress and cancellation between embedding batches, and that package is a
+new dependency for one class.
+
+**LLM-based**. The chat model decides the boundaries. The text is cut into numbered sentences;
+the model sees a window of them and replies with the numbers where a new topic starts. The
+chunks are then assembled from the original text.
+
+| Parameter | Default | Range | Meaning |
+|---|---|---|---|
+| `target_chunk_chars` | 1000 | 300 - 8000 | Size the prompt asks the model to aim for. A page no longer than this is one chunk, without a model call |
+| `max_chunk_chars` | 2000 | 500 - 16000 | A larger chunk is cut between sentences |
+| `window_chars` | 6000 | 2000 - 16000 | Text shown to the model per call. Larger means fewer calls but a longer prompt |
+
+Design points that follow from what is already known about `gemma4:e4b-mlx`:
+
+- The model returns **boundaries, never text**. It cannot alter or invent document content, and
+  the reply stays a few tokens long.
+- Reply format is two plain-text lines (`Reason: ...` / `Splits: 4, 9, 15`) parsed with a regex,
+  like `invoke_decision`. No JSON-constrained output.
+- A new `chunking_model` client in `llm/`: no thinking, temperature 0, output limit
+  `CHUNKING_MAX_TOKENS` (default 200). The prompt goes in a new
+  `ingestion/chunking/prompts.py`, not `agent/prompts.py`: `ingestion/` does not import from
+  `agent/`.
+- Numbers outside the window or not increasing are dropped. A reply with no usable line means
+  that window is split by size instead (between sentences, at the target size); the number of
+  such windows is counted and reported in the upload summary, so a strategy that silently
+  degraded is visible.
+- A sentence is shown to the model on one line, cut at 500 characters, which bounds the prompt
+  for text without sentence punctuation.
+- When a window ends mid-topic, the sentences after its last boundary start the next window.
+- Ollama unreachable fails the ingestion with the usual message (same as for embedding).
+
+#### 3. Cost
+
+| Strategy | Extra work per document | Expectation |
+|---|---|---|
+| Recursive | none | milliseconds |
+| Semantic | one embedding per sentence, in batches of `EMBED_BATCH_SIZE`, on top of embedding the final chunks | measured: about 0.3 s per sentence (5 s per batch of 16); 169 sentences on 8 pages of prose took 53 s |
+| LLM-based | about one chat call per page (a page usually fits one window) | measured: 1 to 4 s per call; 8 pages took 33 s in one run, 4 pages 4.5 s in another |
+
+Both are comparable to or smaller than parsing (6 to 10 s per page). Both alternate with or
+reuse the models on the Mac; LLM-based chunking loads the chat model during ingestion, then the
+embedding model, so watch `ollama ps` for eviction.
+
+#### 4. Design
+
+| Item | Design |
+|---|---|
+| Config model | `ChunkingConfig` in `schemas.py`: a discriminated union on `strategy` (`recursive` / `semantic` / `llm`) of three pydantic models holding the parameters above, with the ranges as validators. This is what crosses every layer, and what is stored. |
+| Settings | `CHUNKER` stays the default strategy. New defaults: `SEMANTIC_BREAKPOINT_PERCENTILE`, `SEMANTIC_BUFFER_SENTENCES`, `SEMANTIC_MIN_CHUNK_CHARS`, `SEMANTIC_MAX_CHUNK_CHARS`, `LLM_CHUNK_TARGET_CHARS`, `LLM_CHUNK_MAX_CHARS`, `LLM_CHUNK_WINDOW_CHARS`, `CHUNKING_MAX_TOKENS`. `Settings.chunking_defaults()` builds one `ChunkingConfig` per strategy from them and `default_chunking()` picks the `CHUNKER` one; an out-of-range default fails when the settings load. `TABLE_MAX_CHARS` stays a setting only, not in the UI. |
+| Chunker interface | `Chunker.chunk(elements, *, doc_id, metadata, checkpoint=None)`. `checkpoint(message, current, total)` is the pipeline's existing stop-and-report hook, called between embedding batches (semantic) and between model calls (LLM), so progress shows "Chunking: embedding sentences (32 of 169 done)" and a deleted upload stops within one batch. |
+| Factory | `get_chunker(config, settings)` in `chunking/factory.py`; `CHUNKERS` maps strategy name to a builder taking the config. The semantic builder gets the text embedder, the LLM builder the chunking model. Adding a fourth strategy is still: implement, add a params model, register. |
+| Pipeline | `IngestionPipeline.run(..., chunking: ChunkingConfig | None = None)`; `None` means the configured default. The chunker is built per run instead of once in `build_pipeline` (construction is cheap; the embedder and model clients are reused). `IngestionResult` gains `chunking` and `n_chunk_fallbacks`. |
+| Service | `DocumentService.ingest(..., chunking: ChunkingConfig | None = None)`, plus `chunking_defaults` (one default config per strategy) and `default_chunker` for the UI. `DocumentInfo` gains `chunker`, `chunk_params` and, on the value `ingest` returns, `chunk_fallbacks`. |
+| Record | Migration 0004: `documents.chunker` (VARCHAR, existing rows `recursive`) and `documents.chunk_params` (JSONB, nullable), written when the upload is registered, so a failed upload shows them too. Each chunk's Milvus `metadata` JSON also gets `chunker`, so text chunk cards in the Chat tab show which strategy produced a retrieved chunk. No Milvus schema change, no re-ingestion. |
+| UI | Under the uploader: a select box "Chunking strategy" (Recursive / Semantic / LLM-based) with a one-line description and cost note, then an expander "Parameters" showing that strategy's number inputs with a help text each. The inputs are generated from the strategy's model (field title, description, bounds), so a new strategy needs no UI code. Not inside `st.form`, because the parameter widgets must change when the strategy changes. Widget keys include the strategy, so each keeps its own values. The settings apply to all files of one upload. Invalid combinations (overlap not below size, min above max) disable the upload button with a message. |
+| Documents table | New "Chunking" column (strategy name; parameters in its tooltip). The upload summary names the strategy, and warns if LLM windows fell back to recursive. |
+| CLI | `scripts/documents.py ingest <file> --chunker semantic --chunk-param breakpoint_percentile=85` (repeatable). |
+| Layering | `app/` builds a `ChunkingConfig` from `ragdoc.schemas` and passes it to the service; it imports nothing else. |
+
+#### 5. Steps
+
+- [x] Spike on 8 pages of a real document (page text read with pypdfium2): 7 to 44 sentences
+      per page, median sentence 137 characters. Semantic: 53 s, 25 chunks, median 842
+      characters. LLM-based: 8 calls, 33 s, 36 chunks, median 548, boundaries at the section
+      headings, no unreadable reply. Defaults kept. The sample PDFs are too small to show a
+      difference: their pages are under 1000 characters, so each page is one chunk
+- [x] `ChunkingConfig` and the params models in `schemas.py`; new `Settings` fields,
+      `chunking_defaults()` and `default_chunking()`; `.env.example`
+- [x] Shared base for tables and images; `RecursiveChunker` on top of it with unchanged output
+- [x] Sentence splitter; `SemanticChunker`
+- [x] `get_chunking_model` in `llm/chat.py`; prompt; `LLMChunker` with reply parsing and fallback
+- [x] Factory taking a config; `checkpoint` in the `Chunker` protocol
+- [x] Pipeline and service arguments; migration 0004 (applied); repository and `DocumentInfo`
+- [x] UI: strategy select, parameter expander, table column, summary, chunk cards; CLI flags
+- [x] Unit and headless UI tests: 116 pass (`-m "not integration"`)
+- [ ] Integration tests: written (`test_text_is_chunked_by_the_chosen_strategy` with the real
+      models, service tests for the recorded choice) but **not yet run to completion**. One
+      run hit the 10-minute limit, the next was stopped on request
+- [x] App container rebuilt with this phase; it starts, applies nothing new (0004 already
+      applied from the host) and lists the existing documents as `recursive`
+- [ ] In the container: one upload per strategy through the UI, then the same question against
+      each with `scripts/search.py`. Not done
+- [ ] Cancelling an upload during semantic or LLM chunking on a real document (unit-tested only)
+- [x] CLAUDE.md and D4 updated
+- **Done when**: the same file can be indexed with each of the three strategies from the
+  browser, the documents table shows which one was used with which parameters, and deleting an
+  upload during semantic or LLM chunking stops it.
+
+Changed from the plan while building:
+- A chunk over the maximum is cut between sentences, not with the recursive splitter: the spike
+  showed chunks ending in the middle of a sentence.
+- Parameters are number inputs generated from the strategy's model, not hand-written widgets
+  with a slider.
+- The semantic threshold is one percentile over the whole document, so a strategy receives all
+  text elements at once (`split_texts`).
+
+#### Not in this phase
+
+- **Re-chunking an indexed document.** Uploading a file again with another strategy still raises
+  `DuplicateDocumentError`; to try another strategy, delete the document and upload it again,
+  which parses it again. A "re-index with other settings" action that reuses the stored upload
+  (and ideally cached parsed elements) is the natural follow-up, see Q4.
+- Chunks spanning pages. A topic that continues over a page break is still cut there.
+- Rewriting or summarising chunks with the model (contextual headers, propositions).
+- A strategy for tables or images.
+
 ### Phase 6: Hardening
 - [ ] Performance view (latency per node, tokens) read from `query_metrics`
 - [ ] Error states in the UI (Ollama down, model not pulled, Milvus unreachable)
@@ -327,7 +483,7 @@ batch (roughly 30 to 40 s at the default size).
 - **Done when**: the UI shows both scores and the evaluation script reports the difference.
 
 ### Later
-- Other chunkers (semantic, layout-aware) via the `Chunker` interface
+- Other chunkers (layout-aware) via the `Chunker` interface; semantic and LLM-based are Phase 5d
 - Hybrid search (BM25 + dense) in Milvus
 - Image captions as extra text chunks, to complement image embeddings
 - FastAPI layer over `services/`; background ingestion queue
@@ -335,7 +491,11 @@ batch (roughly 30 to 40 s at the default size).
 ## 6. Open questions
 
 - ~~**Q1. Does `gemma4:e4b-mlx` accept images through Ollama?**~~ Resolved 2026-10-01: yes.
-  `scripts/check_ollama.py` sent it a test image and it answered correctly.- **Q2. Scale.** Expected number and size of documents. Large uploads would move ingestion to a
+  `scripts/check_ollama.py` sent it a test image and it answered correctly.
+- **Q4. Comparing chunking strategies on one document (Phase 5d).** As planned, trying another
+  strategy means delete and upload again, paying the parse again. If comparing is the main use,
+  a re-index action that reuses the upload should move into the phase.
+- **Q2. Scale.** Expected number and size of documents. Large uploads would move ingestion to a
   background worker sooner.
 - **Q3. Other languages later.** `qwen3-embedding` is multilingual, but `clip-ViT-B-32` is not.
   Moving beyond English means swapping the image embedder (for example `jinaai/jina-clip-v2`) and

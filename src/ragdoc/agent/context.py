@@ -11,7 +11,10 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from ragdoc.agent.state import HistoryMessage
 from ragdoc.config import Settings
+from ragdoc.llm.chat import text_of
 from ragdoc.schemas import RetrievalResult, RetrievedChunk
+
+__all__ = ["text_of"]  # lives in llm/ (ingestion uses it too); nodes import it from here
 
 # [1], [2][3] and [1, 2]
 CITATION = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
@@ -94,15 +97,6 @@ def usage_of(message: BaseMessage | None) -> dict[str, int]:
         "prompt_tokens": usage.get("input_tokens", 0),
         "completion_tokens": usage.get("output_tokens", 0),
     }
-
-
-def text_of(message: BaseMessage) -> str:
-    content = message.content
-    if isinstance(content, str):
-        return content
-    return "".join(
-        block.get("text", "") if isinstance(block, dict) else str(block) for block in content
-    )
 
 
 def reasoning_of(message: BaseMessage) -> str:

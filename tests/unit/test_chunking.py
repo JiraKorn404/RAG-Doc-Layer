@@ -94,9 +94,9 @@ def test_image_becomes_one_chunk_with_caption_as_content():
 
 
 def test_factory_builds_configured_chunker():
-    assert isinstance(get_chunker(Settings(_env_file=None)), RecursiveChunker)
+    assert isinstance(get_chunker(settings=Settings(_env_file=None)), RecursiveChunker)
 
 
-def test_factory_rejects_unknown_chunker():
-    with pytest.raises(ValueError, match="Unknown chunker"):
-        get_chunker(Settings(_env_file=None, chunker="nope"))
+def test_unknown_default_chunker_is_rejected():
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, chunker="nope")

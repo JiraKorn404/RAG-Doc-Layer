@@ -2,10 +2,10 @@
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Annotated, Any, ClassVar, Literal, Self
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class ChunkType(StrEnum):
@@ -60,6 +60,164 @@ class RetrievalResult(BaseModel):
     @property
     def is_empty(self) -> bool:
         return not self.text and not self.images
+
+
+class _Chunking(BaseModel):
+    """How the text of one upload is split. Tables and images are handled the same way
+    whatever the strategy.
+
+    Each field's `title` and `description` are the label and help text of its input on the
+    Documents tab, and its bounds are the input's range.
+    """
+
+    label: ClassVar[str]
+    summary: ClassVar[str]
+
+    @property
+    def params(self) -> dict[str, int]:
+        """The tunable values, without the strategy name."""
+        return self.model_dump(exclude={"strategy"})
+
+
+class RecursiveChunking(_Chunking):
+    label: ClassVar[str] = "Recursive"
+    summary: ClassVar[str] = (
+        "Cuts the text into pieces of a fixed maximum size, at paragraph and sentence breaks "
+        "where possible. Fast: no model is involved."
+    )
+
+    strategy: Literal["recursive"] = "recursive"
+    chunk_size: int = Field(
+        default=1000,
+        ge=200,
+        le=16000,
+        title="Chunk size (characters)",
+        description="Maximum number of characters in a chunk.",
+    )
+    chunk_overlap: int = Field(
+        default=150,
+        ge=0,
+        le=8000,
+        title="Overlap (characters)",
+        description="Characters repeated between neighbouring chunks. Must be below the size.",
+    )
+
+    @model_validator(mode="after")
+    def _overlap_below_size(self) -> Self:
+        if self.chunk_overlap >= self.chunk_size:
+            raise ValueError("The overlap must be smaller than the chunk size.")
+        return self
+
+
+class SemanticChunking(_Chunking):
+    label: ClassVar[str] = "Semantic"
+    summary: ClassVar[str] = (
+        "Starts a new chunk where the topic changes, found by comparing the embeddings of "
+        "neighbouring sentences. Slower: every sentence is embedded."
+    )
+
+    strategy: Literal["semantic"] = "semantic"
+    breakpoint_percentile: int = Field(
+        default=90,
+        ge=50,
+        le=99,
+        title="Breakpoint percentile",
+        description=(
+            "A chunk boundary is placed where the change between neighbouring sentences is "
+            "above this percentile of all changes in the document. Lower gives more, smaller "
+            "chunks."
+        ),
+    )
+    buffer_sentences: int = Field(
+        default=1,
+        ge=0,
+        le=3,
+        title="Buffer (sentences)",
+        description=(
+            "Sentences on each side that are joined to a sentence before it is embedded, so "
+            "that very short sentences do not cause boundaries."
+        ),
+    )
+    min_chunk_chars: int = Field(
+        default=200,
+        ge=0,
+        le=2000,
+        title="Minimum chunk size (characters)",
+        description="A smaller chunk is merged into its neighbour.",
+    )
+    max_chunk_chars: int = Field(
+        default=2000,
+        ge=500,
+        le=16000,
+        title="Maximum chunk size (characters)",
+        description="A larger chunk is cut into pieces of at most this size.",
+    )
+
+    @model_validator(mode="after")
+    def _min_below_max(self) -> Self:
+        if self.min_chunk_chars >= self.max_chunk_chars:
+            raise ValueError("The minimum chunk size must be smaller than the maximum.")
+        return self
+
+
+class LLMChunking(_Chunking):
+    label: ClassVar[str] = "LLM-based"
+    summary: ClassVar[str] = (
+        "The chat model reads the text and decides where each chunk starts. Slowest: about one "
+        "model call per page."
+    )
+
+    strategy: Literal["llm"] = "llm"
+    target_chunk_chars: int = Field(
+        default=1000,
+        ge=300,
+        le=8000,
+        title="Target chunk size (characters)",
+        description="The size the model is asked to aim for. Text shorter than this is not sent.",
+    )
+    max_chunk_chars: int = Field(
+        default=2000,
+        ge=500,
+        le=16000,
+        title="Maximum chunk size (characters)",
+        description="A larger chunk is cut into pieces of at most this size.",
+    )
+    window_chars: int = Field(
+        default=6000,
+        ge=2000,
+        le=16000,
+        title="Window (characters)",
+        description=(
+            "How much text the model sees per call. Larger means fewer calls with longer prompts."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _target_within_max(self) -> Self:
+        if self.target_chunk_chars > self.max_chunk_chars:
+            raise ValueError("The target chunk size must not exceed the maximum.")
+        return self
+
+
+ChunkingConfig = Annotated[
+    RecursiveChunking | SemanticChunking | LLMChunking, Field(discriminator="strategy")
+]
+CHUNKING_MODELS: dict[str, type[_Chunking]] = {
+    "recursive": RecursiveChunking,
+    "semantic": SemanticChunking,
+    "llm": LLMChunking,
+}
+
+
+def parse_chunking(strategy: str, params: dict[str, Any] | None = None) -> ChunkingConfig:
+    """Build and validate a chunking configuration from a strategy name and its parameters."""
+    try:
+        model = CHUNKING_MODELS[strategy]
+    except KeyError:
+        raise ValueError(
+            f"Unknown chunker {strategy!r}. Available: {', '.join(CHUNKING_MODELS)}"
+        ) from None
+    return model(**(params or {}))
 
 
 class IngestionProgress(BaseModel):

@@ -18,7 +18,7 @@ decision changes.
 | Image embeddings | `sentence-transformers` `clip-ViT-B-32` (512-dim), runs in the app process on the Windows machine because Ollama cannot embed images |
 | Orchestration | LangGraph custom `StateGraph` (not a prebuilt ReAct agent) |
 | Parsing | Docling (text, tables as Markdown, extracted figures, OCR) |
-| Chunking | Recursive (`RecursiveCharacterTextSplitter`); tables kept whole |
+| Chunking | Chosen per upload: recursive (default), semantic or LLM-based, each with tunable parameters; tables kept whole |
 | Vector DB | Milvus standalone (Docker), accessed through `pymilvus` `MilvusClient` |
 | Relational DB | PostgreSQL (Docker), SQLAlchemy 2.x + Alembic |
 | Reranking | Not implemented yet. Planned as a later phase (see PLAN.md); retrieval is vector search only for now |
@@ -95,7 +95,8 @@ src/ragdoc/
   llm/                      # chat.py, embeddings.py, image_embeddings.py
   ingestion/
     parser.py               # Docling -> list[ParsedElement] (text | table | image)
-    chunking/               # base.py (Chunker protocol), recursive.py, factory.py
+    chunking/               # base.py (Chunker protocol, shared table/image handling),
+                            # recursive.py, semantic.py, llm.py, sentences.py, prompts.py, factory.py
     pipeline.py             # parse -> chunk -> embed -> store
   storage/
     milvus_store.py         # collections, insert, search, delete by doc_id
@@ -128,6 +129,7 @@ uv sync                                   # install dependencies
 uv run alembic upgrade head               # apply DB migrations
 uv run streamlit run app/streamlit_app.py # start the UI at http://127.0.0.1:8502
 uv run python scripts/documents.py ingest <file>   # add --ocr for scanned files; also: list, delete <id>
+uv run python scripts/documents.py ingest <file> --chunker semantic --chunk-param breakpoint_percentile=85
 uv run python scripts/make_sample_pdf.py  # sample PDF with text, a table and a figure
 uv run python scripts/make_sample_pdf.py out.pdf 20   # a 20-page PDF for testing batches
 uv run python scripts/search.py "<question>"       # top text and image chunks with scores
@@ -154,7 +156,13 @@ New migration after changing `models.py`:
   hosts) live in `Settings` and `.env`. No hard-coded model names or URLs elsewhere.
 - **Swappable parts**: to add a chunker, reranker, parser or embedder, implement the interface in
   its package and register it in that package's factory. Callers do not change.
-- **Prompts** live in `agent/prompts.py`, not inline in nodes.
+  A chunking strategy also needs a parameters model in `schemas.py` (added to `ChunkingConfig`
+  and `CHUNKING_MODELS`) and its defaults in `Settings.chunking_defaults()`. The Documents tab
+  builds its inputs from that model (field `title`, `description` and bounds), so the UI needs
+  no change.
+- **Prompts** live in `agent/prompts.py`, not inline in nodes. The one exception is the
+  chunking prompt in `ingestion/chunking/prompts.py`, because `ingestion/` does not import
+  from `agent/`.
 - **Types**: type hints everywhere; data crossing a layer boundary is a pydantic model from
   `schemas.py`, not a dict.
 - **Tests**: unit tests mock Ollama, Milvus and Postgres. Tests in `tests/integration` need
@@ -194,6 +202,27 @@ New migration after changing `models.py`:
   automatic fallback. With OCR off, text that exists only inside pictures or scanned pages is
   not extracted: a scanned PDF then yields image chunks only (the UI warns), or fails with a
   message pointing at the OCR option if nothing at all is found.
+- Chunking is chosen per upload (`ChunkingConfig`: strategy plus parameters), on the Documents
+  tab or with `--chunker` / `--chunk-param`; `CHUNKER` and the per-strategy settings are only
+  the defaults. The pipeline builds the chunker for each run.
+  - A strategy only decides how text is split (`BaseChunker.split_texts`). Tables, images and
+    "no chunk spans pages" are the same for all three.
+  - Semantic: every sentence is embedded (with `buffer_sentences` neighbours); a boundary goes
+    where the distance to the next sentence is above `breakpoint_percentile` of all distances
+    in the document. Measured: about 0.3 s per sentence, 53 s for 8 pages of prose.
+  - LLM-based: the chat model sees numbered sentences and replies `Reason:` / `Splits: 4, 9`
+    (plain text, regex, like `invoke_decision`). It returns boundaries only, never text. About
+    one call per page, 1 to 4 s each. A reply that cannot be read makes that window fall back
+    to splitting by size; the count is shown in the upload summary. Text no longer than
+    `target_chunk_chars` is not sent to the model at all.
+  - Both make Ollama calls during the "chunk" stage, so that stage reports progress and can be
+    cancelled, through the `checkpoint` argument of `Chunker.chunk`.
+  - A chunk over the strategy's maximum is cut between sentences; sentence splitting is a
+    regex that assumes English.
+  - The choice is stored in `documents.chunker` / `documents.chunk_params` and in every
+    chunk's `metadata["chunker"]` (shown on text chunk cards). Documents indexed before
+    migration 0004 have no `chunker` in their chunk metadata.
+  - Trying another strategy on a file already indexed means deleting it first (same hash).
 - Tables are stored as Markdown in one chunk. Tables over `TABLE_MAX_CHARS` are split by rows
   with the header row (and caption) repeated.
 - The parser merges consecutive text on one page before chunking, so text chunks never span

@@ -3,6 +3,7 @@
 import uuid
 from collections.abc import Collection, Sequence
 from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -31,6 +32,8 @@ class DocumentRepository:
         file_hash: str,
         file_path: str,
         document_id: uuid.UUID | None = None,
+        chunker: str = "recursive",
+        chunk_params: dict[str, Any] | None = None,
     ) -> Document:
         """Register a document as `processing`. Pass `document_id` when the id is needed
         beforehand (it names the upload and image folders)."""
@@ -39,6 +42,8 @@ class DocumentRepository:
             filename=filename,
             file_hash=file_hash,
             file_path=file_path,
+            chunker=chunker,
+            chunk_params=chunk_params,
         )
         self._session.add(document)
         self._session.flush()

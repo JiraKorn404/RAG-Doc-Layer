@@ -2,9 +2,12 @@
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal, Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from ragdoc.schemas import ChunkingConfig, LLMChunking, RecursiveChunking, SemanticChunking
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -49,11 +52,23 @@ class Settings(BaseSettings):
     postgres_db: str = "ragdoc"
 
     # Ingestion
-    chunker: str = "recursive"
+    # The chunking strategy an upload uses unless it chooses another: recursive, semantic or
+    # llm. The values below are each strategy's defaults; an upload can override them too.
+    # Their allowed ranges are those of the models in `schemas.py`.
+    chunker: Literal["recursive", "semantic", "llm"] = "recursive"
     # Sizes are in characters. The upper bound keeps any chunk inside Milvus's 65535-byte
     # VARCHAR limit even when every character takes 4 bytes.
     chunk_size: int = Field(default=1000, gt=0, le=16000)
     chunk_overlap: int = Field(default=150, ge=0)
+    semantic_breakpoint_percentile: int = 90
+    semantic_buffer_sentences: int = 1
+    semantic_min_chunk_chars: int = 200
+    semantic_max_chunk_chars: int = 2000
+    llm_chunk_target_chars: int = 1000
+    llm_chunk_max_chars: int = 2000
+    llm_chunk_window_chars: int = 6000
+    # Output limit of the model call that picks chunk boundaries (a reason and some numbers).
+    chunking_max_tokens: int = Field(default=200, gt=0)
     # Tables stay in one chunk up to this size, then are split by rows with the header repeated.
     table_max_chars: int = Field(default=4000, gt=0, le=16000)
     # Extracted pictures smaller than this on either side (icons, bullets, logos) are skipped.
@@ -86,6 +101,35 @@ class Settings(BaseSettings):
 
     # Storage on disk
     data_dir: Path = Path("data")
+
+    @model_validator(mode="after")
+    def _chunking_defaults_are_valid(self) -> Self:
+        # Fail at start-up, not at the first upload, if .env holds an out-of-range default.
+        self.chunking_defaults()
+        return self
+
+    def chunking_defaults(self) -> dict[str, ChunkingConfig]:
+        """The configured default parameters of every chunking strategy, by strategy name."""
+        return {
+            "recursive": RecursiveChunking(
+                chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap
+            ),
+            "semantic": SemanticChunking(
+                breakpoint_percentile=self.semantic_breakpoint_percentile,
+                buffer_sentences=self.semantic_buffer_sentences,
+                min_chunk_chars=self.semantic_min_chunk_chars,
+                max_chunk_chars=self.semantic_max_chunk_chars,
+            ),
+            "llm": LLMChunking(
+                target_chunk_chars=self.llm_chunk_target_chars,
+                max_chunk_chars=self.llm_chunk_max_chars,
+                window_chars=self.llm_chunk_window_chars,
+            ),
+        }
+
+    def default_chunking(self) -> ChunkingConfig:
+        """What an upload uses when it does not choose."""
+        return self.chunking_defaults()[self.chunker]
 
     @property
     def postgres_dsn(self) -> str:

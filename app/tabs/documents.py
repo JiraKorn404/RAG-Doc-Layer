@@ -1,9 +1,10 @@
 """Tab 2: upload documents, see what is indexed, delete."""
 
 import streamlit as st
+from pydantic import ValidationError
 
 from components.text import duration
-from ragdoc.schemas import IngestionProgress
+from ragdoc.schemas import ChunkingConfig, IngestionProgress
 from ragdoc.services.document_service import (
     DocumentInfo,
     DocumentService,
@@ -38,9 +39,19 @@ def summary(document: DocumentInfo) -> list[tuple[str, str]]:
             "success",
             f"**{document.filename}**: {document.n_text_chunks} text, "
             f"{document.n_table_chunks} table and {document.n_image_chunks} image chunks "
-            f"indexed{took}. OCR was {'on' if document.ocr_used else 'off'}.",
+            f"indexed{took}. OCR was {'on' if document.ocr_used else 'off'}. "
+            f"Chunking: {document.chunker}.",
         )
     ]
+    if document.chunk_fallbacks:
+        messages.append(
+            (
+                "warning",
+                f"**{document.filename}**: the model's reply could not be used for "
+                f"{document.chunk_fallbacks} part(s) of the text, which were split by size "
+                "instead.",
+            )
+        )
     if not document.ocr_used and document.n_text_chunks + document.n_table_chunks == 0:
         messages.append(
             (
@@ -53,7 +64,53 @@ def summary(document: DocumentInfo) -> list[tuple[str, str]]:
     return messages
 
 
-def ingest_files(service: DocumentService, files, ocr: bool) -> None:
+def chunking_inputs(service: DocumentService) -> ChunkingConfig | None:
+    """The strategy picker and the parameters of the chosen strategy.
+
+    Returns None, after showing why, when the values entered do not fit together. The inputs
+    are generated from the strategy's model in `schemas.py`: label, help text and range of each
+    parameter come from its field.
+    """
+    defaults = service.chunking_defaults
+    names = list(defaults)
+    strategy = st.selectbox(
+        "Chunking strategy",
+        names,
+        index=names.index(service.default_chunker),
+        format_func=lambda name: defaults[name].label,
+        help=(
+            "How the text of the documents is cut into searchable pieces. Tables and images "
+            "are handled the same way whichever you choose."
+        ),
+    )
+    default = defaults[strategy]
+    st.caption(default.summary)
+
+    values: dict[str, int] = {}
+    with st.expander("Parameters"):
+        for name, field in type(default).model_fields.items():
+            if name == "strategy":
+                continue
+            low = next((m.ge for m in field.metadata if hasattr(m, "ge")), None)
+            high = next((m.le for m in field.metadata if hasattr(m, "le")), None)
+            # Keyed by strategy, so each strategy keeps the values entered for it.
+            values[name] = st.number_input(
+                field.title or name,
+                min_value=low,
+                max_value=high,
+                value=getattr(default, name),
+                step=1 if high is not None and high <= 100 else 50,
+                help=field.description,
+                key=f"chunking-{strategy}-{name}",
+            )
+    try:
+        return type(default)(**values)
+    except ValidationError as exc:
+        st.error("; ".join(error["msg"].removeprefix("Value error, ") for error in exc.errors()))
+        return None
+
+
+def ingest_files(service: DocumentService, files, ocr: bool, chunking: ChunkingConfig) -> None:
     results: list[tuple[str, str]] = []
     for file in files:
         # Not `with st.status(...)`: leaving that block would mark the status complete.
@@ -72,7 +129,9 @@ def ingest_files(service: DocumentService, files, ocr: bool) -> None:
             line.markdown(f"{progress.message}{counts} · {duration(progress.elapsed_s)} elapsed")
 
         try:
-            document = service.ingest(file.name, file.getvalue(), on_progress=show, ocr=ocr)
+            document = service.ingest(
+                file.name, file.getvalue(), on_progress=show, ocr=ocr, chunking=chunking
+            )
         except DuplicateDocumentError as exc:
             status.update(label=f"{file.name}: already uploaded", state="error")
             results.append(("warning", f"**{file.name}**: {exc}"))
@@ -119,8 +178,9 @@ def render_upload(service: DocumentService) -> None:
             "searchable. It is never switched on automatically."
         ),
     )
-    if st.button("Upload and index", type="primary", disabled=not files):
-        ingest_files(service, files, ocr)
+    chunking = chunking_inputs(service)
+    if st.button("Upload and index", type="primary", disabled=not files or chunking is None):
+        ingest_files(service, files, ocr, chunking)
         # A new key gives an empty uploader, so the same files are not offered again.
         st.session_state[UPLOADER_VERSION] = version + 1
         st.rerun()
@@ -170,8 +230,9 @@ def render_list(service: DocumentService) -> None:
         st.info("No documents yet. Upload one above.")
         return
 
-    widths = [3.6, 1.4, 0.8, 0.8, 0.8, 0.7, 1.2, 1.9, 1.2]
-    labels = ["Name", "Status", "Text", "Tables", "Images", "OCR", "Time", "Uploaded", ""]
+    widths = [3.2, 1.3, 0.7, 0.8, 0.8, 0.6, 1.3, 1.1, 1.8, 1.2]
+    labels = "Name Status Text Tables Images OCR Chunking Time Uploaded".split() + [""]
+    strategies = service.chunking_defaults
     header = st.columns(widths)
     for column, label in zip(header, labels, strict=True):
         column.caption(label)
@@ -184,10 +245,13 @@ def render_list(service: DocumentService) -> None:
         row[3].write(document.n_table_chunks)
         row[4].write(document.n_image_chunks)
         row[5].write("on" if document.ocr_used else "off")
+        strategy = strategies.get(document.chunker)
+        params = ", ".join(f"{k} = {v}" for k, v in (document.chunk_params or {}).items())
+        row[6].markdown(strategy.label if strategy else document.chunker, help=params or None)
         took = document.ingest_seconds
-        row[6].write(duration(took) if took is not None else "-")
-        row[7].write(document.created_at.astimezone().strftime("%Y-%m-%d %H:%M"))
-        if row[8].button("Delete", key=f"delete-{document.id}", icon=":material/delete:"):
+        row[7].write(duration(took) if took is not None else "-")
+        row[8].write(document.created_at.astimezone().strftime("%Y-%m-%d %H:%M"))
+        if row[9].button("Delete", key=f"delete-{document.id}", icon=":material/delete:"):
             st.session_state[PENDING_DELETE] = str(document.id)
             st.rerun()
         if document.error:

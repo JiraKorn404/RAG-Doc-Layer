@@ -1,6 +1,7 @@
 """Manage documents from the command line.
 
 uv run python scripts/documents.py ingest path/to/file.pdf
+uv run python scripts/documents.py ingest file.pdf --chunker llm --chunk-param window_chars=4000
 uv run python scripts/documents.py list
 uv run python scripts/documents.py delete <document-id>
 """
@@ -11,7 +12,7 @@ from pathlib import Path
 
 from ragdoc.console import use_utf8_output
 from ragdoc.ingestion.parser import UnsupportedFileTypeError
-from ragdoc.schemas import IngestionProgress
+from ragdoc.schemas import IngestionProgress, parse_chunking
 from ragdoc.services.document_service import (
     DocumentInfo,
     DocumentService,
@@ -26,7 +27,10 @@ def describe(document: DocumentInfo) -> str:
         f"{document.n_image_chunks} image"
     )
     ocr = "ocr on " if document.ocr_used else "ocr off"
-    line = f"{document.id}  {document.status.value:<10}  {counts:<28}  {ocr}  {document.filename}"
+    line = (
+        f"{document.id}  {document.status.value:<10}  {counts:<28}  {ocr}  "
+        f"{document.chunker:<9}  {document.filename}"
+    )
     return f"{line}\n    error: {document.error}" if document.error else line
 
 
@@ -40,6 +44,18 @@ def main() -> int:
     ocr = ingest.add_mutually_exclusive_group()
     ocr.add_argument("--ocr", dest="ocr", action="store_true", default=None, help="OCR on")
     ocr.add_argument("--no-ocr", dest="ocr", action="store_false", help="OCR off")
+    ingest.add_argument(
+        "--chunker",
+        choices=["recursive", "semantic", "llm"],
+        help="chunking strategy (default: the CHUNKER setting)",
+    )
+    ingest.add_argument(
+        "--chunk-param",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="override one parameter of the strategy, e.g. chunk_size=800; repeatable",
+    )
     commands.add_parser("delete").add_argument("document_id")
     args = parser.parse_args()
 
@@ -59,14 +75,32 @@ def main() -> int:
         return 0
 
     if args.command == "ingest":
+        strategy = args.chunker or service.default_chunker
+        params = service.chunking_defaults[strategy].params
+        for item in args.chunk_param:
+            name, _, value = item.partition("=")
+            if name not in params:
+                parser.error(f"{strategy} chunking has no parameter {name!r}: {', '.join(params)}")
+            params[name] = value
+        try:
+            chunking = parse_chunking(strategy, params)
+        except ValueError as exc:
+            parser.error(str(exc))
         try:
             document = service.ingest(
-                args.path.name, args.path.read_bytes(), on_progress=show, ocr=args.ocr
+                args.path.name,
+                args.path.read_bytes(),
+                on_progress=show,
+                ocr=args.ocr,
+                chunking=chunking,
             )
         except (UnsupportedFileTypeError, DuplicateDocumentError, IngestionCancelled) as exc:
             print(exc)
             return 1
         print(describe(document))
+        print("    chunking: " + ", ".join(f"{k}={v}" for k, v in chunking.params.items()))
+        if document.chunk_fallbacks:
+            print(f"    {document.chunk_fallbacks} part(s) split by size: model reply unusable")
         if document.timings:
             print(
                 "    "

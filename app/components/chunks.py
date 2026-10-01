@@ -24,6 +24,10 @@ def score_line(chunk: RetrievedChunk) -> str:
     line = f"Similarity score: {chunk.similarity_score:.4f}"
     if chunk.rerank_score is not None:
         line += f" · Rerank score: {chunk.rerank_score:.4f}"
+    # Which strategy cut this piece of text. Documents indexed before there was a choice do
+    # not say.
+    if chunk.chunk_type is ChunkType.TEXT and chunk.metadata.get("chunker"):
+        line += f" · Chunking: {chunk.metadata['chunker']}"
     return line
 
 

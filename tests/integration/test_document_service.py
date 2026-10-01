@@ -10,6 +10,7 @@ import pytest
 
 from ragdoc.config import Settings
 from ragdoc.ingestion.pipeline import IngestionCancelled, IngestionResult
+from ragdoc.schemas import LLMChunking, SemanticChunking
 from ragdoc.services.document_service import DocumentService
 from ragdoc.storage.postgres.models import DocumentStatus
 from ragdoc.storage.postgres.repositories import DocumentRepository
@@ -26,10 +27,23 @@ class FakePipeline:
         self.error = error
         self.cleaned: list[str] = []
         self.ocr_seen: list[bool] = []
+        self.chunking_seen: list = []
+        self.n_chunk_fallbacks = 0
         self.service: DocumentService | None = None
 
-    def run(self, path, *, doc_id, filename, ocr=False, on_progress=None, should_stop=None):
+    def run(
+        self,
+        path,
+        *,
+        doc_id,
+        filename,
+        ocr=False,
+        chunking=None,
+        on_progress=None,
+        should_stop=None,
+    ):
         self.ocr_seen.append(ocr)
+        self.chunking_seen.append(chunking)
         try:
             if self.during:
                 self.during(self.service, doc_id)
@@ -43,6 +57,8 @@ class FakePipeline:
         return IngestionResult(
             n_text_chunks=3,
             ocr_used=ocr,
+            chunking=chunking,
+            n_chunk_fallbacks=self.n_chunk_fallbacks,
             timings={"parse_ms": 1, "chunk_ms": 1, "embed_ms": 1, "store_ms": 1, "total_ms": 4000},
         )
 
@@ -90,6 +106,31 @@ def test_ready_document_records_ocr_choice_and_time(make_service):
     listed = {d.filename: d for d in service.list_documents()}
     assert listed["a.txt"].ocr_used is True and listed["a.txt"].ingest_seconds == 4.0
     assert listed["b.txt"].ocr_used is False
+
+
+def test_chunking_choice_is_passed_on_and_recorded(make_service):
+    pipeline = FakePipeline()
+    pipeline.n_chunk_fallbacks = 2
+    service = make_service(pipeline, chunker="semantic", semantic_breakpoint_percentile=80)
+    assert service.default_chunker == "semantic"
+    chosen = LLMChunking(window_chars=3000)
+
+    by_default = service.ingest("a.txt", content())
+    by_choice = service.ingest("b.txt", content(), chunking=chosen)
+
+    assert pipeline.chunking_seen == [SemanticChunking(breakpoint_percentile=80), chosen]
+    assert by_choice.chunk_fallbacks == 2
+    listed = {d.filename: d for d in service.list_documents()}
+    assert listed["a.txt"].chunker == "semantic"
+    assert listed["a.txt"].chunk_params["breakpoint_percentile"] == 80
+    assert (listed["b.txt"].chunker, listed["b.txt"].chunk_params) == ("llm", chosen.params)
+    assert by_default.chunker == "semantic" and listed["b.txt"].chunk_fallbacks == 0
+
+
+def test_failed_document_still_shows_its_chunking_choice(make_service):
+    service = make_service(FakePipeline(error=RuntimeError("model crashed")))
+    failed = service.ingest("bad.pdf", content(), chunking=LLMChunking())
+    assert (failed.status, failed.chunker) == (DocumentStatus.FAILED, "llm")
 
 
 def test_deleting_a_processing_document_cancels_its_ingestion(make_service, tmp_path):

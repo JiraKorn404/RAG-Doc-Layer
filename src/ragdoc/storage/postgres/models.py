@@ -54,6 +54,11 @@ class Document(Base):
     n_image_chunks: Mapped[int] = mapped_column(Integer, default=0)
     # Whether OCR was switched on for this upload.
     ocr_used: Mapped[bool] = mapped_column(default=False, server_default="false")
+    # The chunking strategy chosen for this upload, and its parameters.
+    chunker: Mapped[str] = mapped_column(
+        String(32), default="recursive", server_default="recursive"
+    )
+    chunk_params: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = _created_at()
 
 

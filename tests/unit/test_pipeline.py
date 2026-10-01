@@ -12,7 +12,7 @@ from ragdoc.ingestion.parser import (
     UnsupportedFileTypeError,
 )
 from ragdoc.ingestion.pipeline import IngestionCancelled, IngestionError, IngestionPipeline
-from ragdoc.schemas import ChunkType, IngestionProgress
+from ragdoc.schemas import ChunkType, IngestionProgress, LLMChunking
 
 
 class FakeParser:
@@ -62,10 +62,13 @@ def settings(tmp_path):
     return Settings(_env_file=None, data_dir=tmp_path, embed_batch_size=2)
 
 
-def make_pipeline(settings, parser, store=None, text_embedder=None):
+def make_pipeline(settings, parser, store=None, text_embedder=None, chunker_factory=None):
+    def small_chunks(_config):
+        return RecursiveChunker(chunk_size=100, chunk_overlap=10, table_max_chars=500)
+
     return IngestionPipeline(
         parser=parser,
-        chunker=RecursiveChunker(chunk_size=100, chunk_overlap=10, table_max_chars=500),
+        chunker_factory=chunker_factory or small_chunks,
         text_embedder=text_embedder or FakeTextEmbedder(),
         image_embedder_factory=FakeImageEmbedder,
         store=store or MagicMock(),
@@ -90,7 +93,10 @@ def test_run_stores_all_chunk_types_and_reports_counts(settings, tmp_path):
 
     text_chunks, text_vectors = store.insert_text_chunks.call_args.args
     assert len(text_chunks) == len(text_vectors) == result.n_text_chunks + 1
-    assert all(chunk.metadata == {"filename": "f.pdf"} for chunk in text_chunks)
+    assert all(
+        chunk.metadata == {"filename": "f.pdf", "chunker": "recursive"} for chunk in text_chunks
+    )
+    assert result.chunking == settings.default_chunking() and result.n_chunk_fallbacks == 0
     assert max(embedder.batches) <= 2 and sum(embedder.batches) == len(text_chunks)
 
     [image_chunk], image_vectors = store.insert_image_chunks.call_args.args
@@ -166,6 +172,62 @@ def test_stop_during_embedding_stores_nothing(settings, tmp_path):
     assert embedder.batches == [2]
     store.insert_text_chunks.assert_not_called()
     store.delete_document.assert_called_once_with("doc-1")
+
+
+class SlowChunker(RecursiveChunker):
+    """A chunker with two slow steps and one failed window, like the model-based strategies."""
+
+    def split_texts(self, texts, checkpoint):
+        for step in range(2):
+            checkpoint("Chunking: sentences read by the chat model", step, 2)
+        self.n_fallbacks = 1
+        return super().split_texts(texts, checkpoint)
+
+
+def slow_chunker_factory(seen: list):
+    def build(config):
+        seen.append(config)
+        return SlowChunker(chunk_size=100, chunk_overlap=10, table_max_chars=500)
+
+    return build
+
+
+def test_chosen_chunking_reaches_the_factory_the_chunks_and_the_result(settings, tmp_path):
+    store, seen, events = MagicMock(), [], []
+    pipeline = make_pipeline(
+        settings, FakeParser(), store, chunker_factory=slow_chunker_factory(seen)
+    )
+    chunking = LLMChunking(window_chars=3000)
+
+    result = run(pipeline, tmp_path, chunking=chunking, on_progress=events.append)
+
+    assert seen == [chunking]
+    assert result.chunking == chunking and result.n_chunk_fallbacks == 1
+    text_chunks, _vectors = store.insert_text_chunks.call_args.args
+    assert {chunk.metadata["chunker"] for chunk in text_chunks} == {"llm"}
+    chunk_events = [(e.message, e.current, e.total) for e in events if e.stage == "chunk"]
+    assert chunk_events == [
+        ("Chunking", None, None),
+        ("Chunking: sentences read by the chat model", 0, 2),
+        ("Chunking: sentences read by the chat model", 1, 2),
+    ]
+
+
+def test_stop_during_chunking_cancels_and_cleans_up(settings, tmp_path):
+    store, events = MagicMock(), []
+    pipeline = make_pipeline(
+        settings, FakeParser(), store, chunker_factory=slow_chunker_factory([])
+    )
+
+    def stop_at_second_chunking_step() -> bool:
+        return bool(events) and events[-1].current == 0 and events[-1].stage == "chunk"
+
+    with pytest.raises(IngestionCancelled):
+        run(pipeline, tmp_path, on_progress=events.append, should_stop=stop_at_second_chunking_step)
+
+    store.insert_text_chunks.assert_not_called()
+    store.delete_document.assert_called_once_with("doc-1")
+    assert not pipeline.image_dir("doc-1").exists()
 
 
 def test_failure_removes_vectors_and_images_then_reraises(settings, tmp_path):
